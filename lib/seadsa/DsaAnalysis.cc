@@ -14,6 +14,7 @@
 #include "seadsa/Info.hh"
 #include "seadsa/InitializePasses.hh"
 #include "seadsa/Stats.hh"
+#include "seadsa/WellFormed.hh"
 #include "seadsa/support/RemovePtrToInt.hh"
 
 namespace seadsa {
@@ -108,6 +109,9 @@ bool DsaAnalysis::runOnModule(Module &M) {
   }
 
   m_ga->runOnModule(M);
+
+  if (isWellFormedCheckRequested())
+    runWellFormedCheck(M, *m_dl, *m_tliWrapper, getDsaAnalysis());
 
   if (XDsaStats || m_print_stats) {
     DsaInfo i(*m_dl, *m_tliWrapper, getDsaAnalysis());

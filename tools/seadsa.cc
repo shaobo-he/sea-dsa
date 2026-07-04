@@ -28,6 +28,7 @@
 #include "seadsa/InitializePasses.hh"
 #include "seadsa/SeaDsaAliasAnalysis.hh"
 #include "seadsa/ShadowMem.hh"
+#include "seadsa/WellFormed.hh"
 #include "seadsa/support/Debug.h"
 #include "seadsa/support/RemovePtrToInt.hh"
 
@@ -216,6 +217,11 @@ int main(int argc, char **argv) {
       pass_manager.add(seadsa::createDsaPrintCallGraphStatsPass());
     }
 
+    if (seadsa::isWellFormedCheckRequested() && !MemDot && !MemViewer &&
+        !seadsa::PrintDsaStats) {
+      pass_manager.add(new seadsa::DsaAnalysis());
+    }
+
     if (CallGraphDot) {
       pass_manager.add(seadsa::createDsaCallGraphPrinterPass());
     }
@@ -223,7 +229,8 @@ int main(int argc, char **argv) {
     if (AAEval) { pass_manager.add(llvm::createAAEvalPass()); }
 
     if (!MemDot && !MemViewer && !seadsa::PrintDsaStats &&
-        !seadsa::PrintCallGraphStats && !CallGraphDot && !AAEval) {
+        !seadsa::PrintCallGraphStats && !CallGraphDot && !AAEval &&
+        !seadsa::isWellFormedCheckRequested()) {
       llvm::errs() << "No option selected: choose one option between "
                    << "{sea-dsa-dot, sea-dsa-viewer, sea-dsa-stats, "
                    << "sea-dsa-callgraph-dot, sea-dsa-callgraph-stats, "
