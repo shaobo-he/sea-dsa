@@ -15,14 +15,16 @@ namespace seadsa {
 
 class FieldType {
   llvm::Type *m_ty{nullptr};
+  llvm::Type *m_pointee_ty{nullptr};
   bool m_is_omni{false};
   bool m_NOT_IMPLEMENTED{false};
   const char *m_whereNotImpl{""};
 
   FieldType() = default;
+  FieldType(llvm::Type *Ty, llvm::Type *PointeeTy);
 
-  constexpr std::tuple<llvm::Type *, bool> asTuple() const {
-    return std::make_tuple(m_ty, m_NOT_IMPLEMENTED);
+  constexpr std::tuple<llvm::Type *, llvm::Type *, bool> asTuple() const {
+    return std::make_tuple(m_ty, m_pointee_ty, m_NOT_IMPLEMENTED);
   };
 
 public:
@@ -43,6 +45,14 @@ public:
 
   explicit FieldType(llvm::Type *Ty);
 
+  static FieldType mkPointerTo(llvm::Type *PointeeTy,
+                               unsigned AddressSpace = 0) {
+    assert(PointeeTy);
+    return FieldType(
+        llvm::PointerType::get(PointeeTy->getContext(), AddressSpace),
+        PointeeTy);
+  }
+
   FieldType(const FieldType &ft) = default;
   FieldType &operator=(const FieldType &) = default;
 
@@ -53,6 +63,7 @@ public:
   bool isPointer() const { return m_ty && m_ty->isPointerTy(); }
   bool isUnknown() const { return !isOmniType() && !m_ty; }
   bool isOmniType() const { return m_is_omni; }
+  bool hasPointeeType() const { return m_pointee_ty; }
 
   llvm::Type *getLLVMType() const { return m_ty; }
 
@@ -85,8 +96,7 @@ public:
 
   FieldType ptrOf() const {
     assert(!isUnknown());
-    auto *PtrTy = llvm::PointerType::get(m_ty, 0);
-    return FieldType(PtrTy);
+    return mkPointerTo(m_ty);
   }
 
   void dump(llvm::raw_ostream &OS = llvm::errs()) const {
@@ -105,7 +115,14 @@ public:
       if (!m_ty) return;
     }
 
-    if (m_ty->isStructTy())
+    if (m_pointee_ty) {
+      OS << "ptr<";
+      if (m_pointee_ty->isStructTy())
+        OS << '%' << m_pointee_ty->getStructName();
+      else
+        m_pointee_ty->print(OS, false);
+      OS << ">";
+    } else if (m_ty->isStructTy())
       OS << '%' << m_ty->getStructName();
     else
       m_ty->print(OS, false);

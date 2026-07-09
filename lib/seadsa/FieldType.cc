@@ -46,7 +46,8 @@ llvm::Type *GetInnermostTypeImpl(llvm::Type *const Ty, SeenTypes &seen) {
     if (!FirstTy) break;
 
     // FIXME: We cannot check this
-    // if (FirstTy->isPointerTy() && FirstTy->getPointerElementType() == currentTy)
+    // if (FirstTy->isPointerTy() && FirstTy->getPointerElementType() ==
+    // currentTy)
     //   break;
 
     if (FirstTy == currentTy) break;
@@ -61,7 +62,8 @@ llvm::Type *GetInnermostTypeImpl(llvm::Type *const Ty, SeenTypes &seen) {
 
 /// This is intended to be used within a single llvm::Context. When there's more
 /// than one context, the caching might misbehave.
-/// LLVM 15: the lack of a pointee type means that pointers are also primitive types, which may be returned.
+/// LLVM 15: the lack of a pointee type means that pointers are also primitive
+/// types, which may be returned.
 llvm::Type *GetFirstPrimitiveTy(llvm::Type *const Ty) {
   assert(Ty);
 
@@ -75,17 +77,19 @@ static bool IsOmnipotentChar(llvm::Type *const Ty) {
     return ITy->getBitWidth() == 8;
   else if (auto *ATy = llvm::dyn_cast<const llvm::ArrayType>(Ty)) {
     // -- array of omni chars is an omni char
-    // -- used by RustC (or llvm optimizer), where [0 x i8]* is used instead of i8*
-    return ATy->getNumElements() == 0 && IsOmnipotentChar(ATy->getElementType());
+    // -- used by RustC (or llvm optimizer), where [0 x i8]* is used instead of
+    // i8*
+    return ATy->getNumElements() == 0 &&
+           IsOmnipotentChar(ATy->getElementType());
   }
 
   return false;
 }
 
 static bool IsOmnipotentPtr(llvm::Type *const Ty) {
-  // LLVM 15, Kevin: Opaque pointer prevents us from being able to determine if a pointer
-  // is omnipotent. Conservatively return false.
-  return false;
+  auto *PTy = llvm::dyn_cast<llvm::PointerType>(Ty);
+  if (!PTy || PTy->isOpaque()) return false;
+  return IsOmnipotentChar(PTy->getNonOpaquePointerElementType());
 }
 
 FieldType::FieldType(llvm::Type *Ty) {
@@ -109,6 +113,13 @@ FieldType::FieldType(llvm::Type *Ty) {
       s_shown = true;
     }
   }
+}
+
+FieldType::FieldType(llvm::Type *Ty, llvm::Type *PointeeTy) : FieldType(Ty) {
+  assert(PointeeTy);
+  m_pointee_ty = IsNotTypeAware() ? nullptr : PointeeTy;
+  if (m_pointee_ty && EnableOmnipotentChar)
+    m_is_omni = IsOmnipotentChar(m_pointee_ty);
 }
 
 bool FieldType::IsNotTypeAware() { return !g_IsTypeAware; }

@@ -21,6 +21,7 @@
 
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/PostOrderIterator.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Analysis/CFG.h"
 #include "llvm/Analysis/LoopInfo.h"
@@ -33,6 +34,7 @@
 #include "llvm/IR/InstVisitor.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/Operator.h"
 #include "llvm/IR/PatternMatch.h"
 
 #include "seadsa/AllocWrapInfo.hh"
@@ -137,6 +139,233 @@ Function *getCalledFunction(CallBase &CB) {
   fn = dyn_cast<Function>(v);
 
   return fn;
+}
+
+struct TypeEvidence {
+  Type *Ty = nullptr;
+  bool Conflict = false;
+
+  void merge(Type *Candidate) {
+    if (!Candidate || Conflict) return;
+    if (!Ty) {
+      Ty = Candidate;
+      return;
+    }
+    if (Ty != Candidate) {
+      Ty = nullptr;
+      Conflict = true;
+    }
+  }
+};
+
+Type *inferPointeeType(const Value *V, SmallPtrSetImpl<const Value *> &Seen);
+Type *inferPointeeTypeFromUses(const Value *V,
+                               SmallPtrSetImpl<const Value *> &Seen);
+
+Type *accessTypeForValue(const Value *V, SmallPtrSetImpl<const Value *> &Seen) {
+  Type *Ty = V->getType();
+  if (!Ty->isPointerTy()) return Ty;
+
+  Type *PointeeTy = inferPointeeType(V, Seen);
+  if (!PointeeTy) return Ty;
+
+  return PointerType::get(PointeeTy, cast<PointerType>(Ty)->getAddressSpace());
+}
+
+Type *accessTypeForValue(const Value *V) {
+  SmallPtrSet<const Value *, 16> Seen;
+  return accessTypeForValue(V, Seen);
+}
+
+bool hasPointerTypeEvidence(Type *Ty) {
+  auto *PTy = dyn_cast<PointerType>(Ty);
+  return !PTy || !PTy->isOpaque();
+}
+
+Type *memoryAccessTypeForLoad(const LoadInst &LI) {
+  SmallPtrSet<const Value *, 16> Seen;
+  Type *AccessTy = accessTypeForValue(&LI, Seen);
+  if (hasPointerTypeEvidence(AccessTy)) return AccessTy;
+
+  if (Type *MemoryTy = inferPointeeType(LI.getPointerOperand(), Seen))
+    return MemoryTy;
+
+  return AccessTy;
+}
+
+Type *memoryAccessTypeForStore(const StoreInst &SI) {
+  SmallPtrSet<const Value *, 16> Seen;
+  Type *AccessTy = accessTypeForValue(SI.getValueOperand(), Seen);
+  if (hasPointerTypeEvidence(AccessTy)) return AccessTy;
+
+  if (Type *MemoryTy = inferPointeeType(SI.getPointerOperand(), Seen))
+    return MemoryTy;
+
+  return AccessTy;
+}
+
+bool isUsefulFieldEvidence(const seadsa::FieldType &FTy) {
+  return !FTy.isUnknown() && (!FTy.isPointer() || FTy.hasPointeeType());
+}
+
+void mergeFieldEvidence(seadsa::FieldType Candidate, seadsa::FieldType &Result,
+                        bool &HasResult, bool &Conflict) {
+  if (!isUsefulFieldEvidence(Candidate) || Conflict) return;
+  if (!HasResult) {
+    Result = Candidate;
+    HasResult = true;
+    return;
+  }
+  if (!(Result == Candidate)) {
+    Result = seadsa::FieldType::mkUnknown();
+    Conflict = true;
+  }
+}
+
+seadsa::FieldType fieldTypeForValue(const Value *V,
+                                    SmallPtrSetImpl<const Value *> &Seen) {
+  Type *Ty = V->getType();
+  if (Ty->isPointerTy()) {
+    if (Type *PointeeTy = inferPointeeType(V, Seen))
+      return seadsa::FieldType::mkPointerTo(
+          PointeeTy, cast<PointerType>(Ty)->getAddressSpace());
+  }
+  return seadsa::FieldType(Ty);
+}
+
+seadsa::FieldType
+fieldTypeForMemoryPointer(const Value *Ptr,
+                          SmallPtrSetImpl<const Value *> &Seen) {
+  const Value *StrippedPtr = Ptr->stripPointerCasts();
+  seadsa::FieldType Result = seadsa::FieldType::mkUnknown();
+  bool HasResult = false;
+  bool Conflict = false;
+
+  for (const Use &U : StrippedPtr->uses()) {
+    const User *Usr = U.getUser();
+
+    if (const auto *LI = dyn_cast<LoadInst>(Usr)) {
+      if (LI->getPointerOperand()->stripPointerCasts() == StrippedPtr)
+        mergeFieldEvidence(fieldTypeForValue(LI, Seen), Result, HasResult,
+                           Conflict);
+      continue;
+    }
+
+    if (const auto *SI = dyn_cast<StoreInst>(Usr)) {
+      if (SI->getPointerOperand()->stripPointerCasts() == StrippedPtr)
+        mergeFieldEvidence(fieldTypeForValue(SI->getValueOperand(), Seen),
+                           Result, HasResult, Conflict);
+      continue;
+    }
+  }
+
+  return Conflict || !HasResult ? seadsa::FieldType::mkUnknown() : Result;
+}
+
+seadsa::FieldType fieldTypeForLoad(const LoadInst &LI) {
+  SmallPtrSet<const Value *, 16> Seen;
+  seadsa::FieldType FTy = fieldTypeForValue(&LI, Seen);
+  if (isUsefulFieldEvidence(FTy)) return FTy;
+
+  FTy = fieldTypeForMemoryPointer(LI.getPointerOperand(), Seen);
+  return FTy.isUnknown() ? seadsa::FieldType(LI.getType()) : FTy;
+}
+
+seadsa::FieldType fieldTypeForStore(const StoreInst &SI) {
+  SmallPtrSet<const Value *, 16> Seen;
+  seadsa::FieldType FTy = fieldTypeForValue(SI.getValueOperand(), Seen);
+  if (isUsefulFieldEvidence(FTy)) return FTy;
+
+  FTy = fieldTypeForMemoryPointer(SI.getPointerOperand(), Seen);
+  return FTy.isUnknown() ? seadsa::FieldType(SI.getValueOperand()->getType())
+                         : FTy;
+}
+
+Type *inferPointeeTypeFromUses(const Value *V,
+                               SmallPtrSetImpl<const Value *> &Seen) {
+  TypeEvidence Evidence;
+  const Value *StrippedV = V->stripPointerCasts();
+
+  for (const Use &U : V->uses()) {
+    const User *Usr = U.getUser();
+
+    if (const auto *GEP = dyn_cast<GEPOperator>(Usr)) {
+      if (GEP->getPointerOperand()->stripPointerCasts() == StrippedV)
+        Evidence.merge(GEP->getSourceElementType());
+      continue;
+    }
+
+    if (const auto *LI = dyn_cast<LoadInst>(Usr)) {
+      if (LI->getPointerOperand()->stripPointerCasts() == StrippedV)
+        Evidence.merge(accessTypeForValue(LI, Seen));
+      continue;
+    }
+
+    if (const auto *SI = dyn_cast<StoreInst>(Usr)) {
+      if (SI->getPointerOperand()->stripPointerCasts() == StrippedV)
+        Evidence.merge(accessTypeForValue(SI->getValueOperand(), Seen));
+      continue;
+    }
+
+    if (const auto *CXI = dyn_cast<AtomicCmpXchgInst>(Usr)) {
+      if (CXI->getPointerOperand()->stripPointerCasts() == StrippedV)
+        Evidence.merge(accessTypeForValue(CXI->getCompareOperand(), Seen));
+      continue;
+    }
+
+    if (const auto *RMWI = dyn_cast<AtomicRMWInst>(Usr)) {
+      if (RMWI->getPointerOperand()->stripPointerCasts() == StrippedV)
+        Evidence.merge(accessTypeForValue(RMWI->getValOperand(), Seen));
+      continue;
+    }
+
+    if (const auto *CB = dyn_cast<CallBase>(Usr)) {
+      if (CB->getCalledOperand() &&
+          CB->getCalledOperand()->stripPointerCasts() == StrippedV)
+        Evidence.merge(CB->getFunctionType());
+      continue;
+    }
+
+    if (isa<CastInst>(Usr) || isa<ConstantExpr>(Usr)) {
+      if (Usr->getType()->isPointerTy())
+        Evidence.merge(inferPointeeTypeFromUses(Usr, Seen));
+      continue;
+    }
+  }
+
+  return Evidence.Conflict ? nullptr : Evidence.Ty;
+}
+
+Type *inferPointeeType(const Value *V, SmallPtrSetImpl<const Value *> &Seen) {
+  if (!V || !V->getType()->isPointerTy()) return nullptr;
+
+  V = V->stripPointerCasts();
+  if (!Seen.insert(V).second) return nullptr;
+
+  if (const auto *F = dyn_cast<Function>(V)) return F->getFunctionType();
+
+  if (const auto *GV = dyn_cast<GlobalVariable>(V)) return GV->getValueType();
+
+  if (const auto *AI = dyn_cast<AllocaInst>(V)) return AI->getAllocatedType();
+
+  if (const auto *GEP = dyn_cast<GEPOperator>(V))
+    return GEP->getResultElementType();
+
+  if (const auto *PN = dyn_cast<PHINode>(V)) {
+    TypeEvidence Evidence;
+    for (const Value *Incoming : PN->incoming_values())
+      Evidence.merge(inferPointeeType(Incoming, Seen));
+    if (!Evidence.Conflict && Evidence.Ty) return Evidence.Ty;
+  }
+
+  if (const auto *SI = dyn_cast<SelectInst>(V)) {
+    TypeEvidence Evidence;
+    Evidence.merge(inferPointeeType(SI->getTrueValue(), Seen));
+    Evidence.merge(inferPointeeType(SI->getFalseValue(), Seen));
+    if (!Evidence.Conflict && Evidence.Ty) return Evidence.Ty;
+  }
+
+  return inferPointeeTypeFromUses(V, Seen);
 }
 
 } // namespace
@@ -319,8 +548,9 @@ class GlobalBuilder : public BlockBuilderBase {
     if (Init->getType()->isPointerTy() && !isa<ConstantPointerNull>(Init)) {
       // FIXME: This creates a node for a global function pointer. Needed by
       // vtable in C++
-      // Disabled for now since in LLVM 15 there is no way to determine if the pointer is a
-      // function. May be inferenced by checking if the pointer is ever loaded as a function.
+      // Disabled for now since in LLVM 15 there is no way to determine if the
+      // pointer is a function. May be inferenced by checking if the pointer is
+      // ever loaded as a function.
 
       // if (cast<PointerType>(Init->getType())
       //         ->getElementType()
@@ -465,7 +695,8 @@ class IntraBlockBuilder : public InstVisitor<IntraBlockBuilder>,
   void visitIntToPtrInst(IntToPtrInst &I);
   void visitPtrToIntInst(PtrToIntInst &I);
   void visitBitCastInst(BitCastInst &I);
-  void visitCmpInst(CmpInst &I) { /* do nothing */ }
+  void visitCmpInst(CmpInst &I) { /* do nothing */
+  }
   void visitInsertValueInst(InsertValueInst &I);
   void visitExtractValueInst(ExtractValueInst &I);
   void visitShuffleVectorInst(ShuffleVectorInst &I);
@@ -717,11 +948,12 @@ void IntraBlockBuilder::visitLoadInst(LoadInst &LI) {
 
   Cell base = valueCell(*LI.getPointerOperand()->stripPointerCasts());
   assert(!base.isNull());
-  base.addAccessedType(0, LI.getType());
+  Type *AccessTy = memoryAccessTypeForLoad(LI);
+  base.addAccessedType(0, AccessTy);
   base.setRead();
   // update/create the link
   if (!isSkip(LI)) {
-    Field LoadedField(0, FieldType(LI.getType()));
+    Field LoadedField(0, fieldTypeForLoad(LI));
 
     if (!base.hasLink(LoadedField)) {
       Node &n = m_graph.mkNode();
@@ -761,13 +993,15 @@ void IntraBlockBuilder::visitAtomicCmpXchgInst(AtomicCmpXchgInst &I) {
 
   PtrC.setModified();
   PtrC.setRead();
-  PtrC.growSize(0, Ptr->getType());
-  PtrC.addAccessedType(0, Ptr->getType());
+  Type *AccessTy =
+      ResTy->isPointerTy() ? accessTypeForValue(I.getCompareOperand()) : ResTy;
+  PtrC.growSize(0, AccessTy);
+  PtrC.addAccessedType(0, AccessTy);
 
   if (ResTy->isPointerTy()) {
     // Load the content of Ptr and make it the cell of the
     // instruction's result.
-    Field LoadedField(0, FieldType(ResTy));
+    Field LoadedField(0, FieldType(AccessTy));
     if (!PtrC.hasLink(LoadedField)) {
       Node &n = m_graph.mkNode();
       PtrC.addLink(LoadedField, Cell(n, 0));
@@ -826,9 +1060,10 @@ void IntraBlockBuilder::visitStoreInst(StoreInst &SI) {
   base.setModified();
 
   Value *ValOp = SI.getValueOperand();
+  Type *AccessTy = memoryAccessTypeForStore(SI);
   // XXX: potentially it is enough to update size only at this point
-  base.growSize(0, ValOp->getType());
-  base.addAccessedType(0, ValOp->getType());
+  base.growSize(0, AccessTy);
+  base.addAccessedType(0, AccessTy);
 
   if (isSkip(*ValOp)) return;
 
@@ -850,12 +1085,7 @@ void IntraBlockBuilder::visitStoreInst(StoreInst &SI) {
   // a ptr type.
   Cell dest(val.getNode(), val.getRawOffset());
 
-  // -- guess best type for the store. Use the type of the value being
-  // -- stored
-  // Since LLVM 15, a loss of precision is incurred compared to past version for when omnichar pointers are being stored
-  Type *ty = ValOp->getType();
-
-  base.addLink(Field(0, FieldType(ty)), dest);
+  base.addLink(Field(0, fieldTypeForStore(SI)), dest);
 }
 
 void IntraBlockBuilder::visitBitCastInst(BitCastInst &I) {
@@ -1122,8 +1352,9 @@ void IntraBlockBuilder::visitInsertValueInst(InsertValueInst &I) {
   Value &v = *I.getInsertedValueOperand();
   uint64_t offset = computeIndexedOffset(I.getType(), I.getIndices(), m_dl);
   Cell out(op, offset);
-  out.growSize(0, v.getType());
-  out.addAccessedType(0, v.getType());
+  Type *AccessTy = accessTypeForValue(&v);
+  out.growSize(0, AccessTy);
+  out.addAccessedType(0, AccessTy);
   out.setModified();
 
   // -- update link
@@ -1131,7 +1362,7 @@ void IntraBlockBuilder::visitInsertValueInst(InsertValueInst &I) {
     // TODO: follow valueCell ptrs.
     Cell vCell = valueCell(v);
     assert(!vCell.isNull());
-    out.addLink(Field(0, FieldType(v.getType())), vCell);
+    out.addLink(Field(0, FieldType(AccessTy)), vCell);
   }
 }
 
@@ -1151,11 +1382,12 @@ void IntraBlockBuilder::visitExtractValueInst(ExtractValueInst &I) {
 
   uint64_t offset = computeIndexedOffset(I.getAggregateOperand()->getType(),
                                          I.getIndices(), m_dl);
-  FieldType opType(I.getType());
+  Type *AccessTy = accessTypeForValue(&I);
+  FieldType opType(AccessTy);
   Cell in(op, offset);
 
   // -- update type record
-  in.addAccessedType(0, I.getType());
+  in.addAccessedType(0, AccessTy);
   in.setRead();
 
   if (!isSkip(I)) {
@@ -1560,8 +1792,8 @@ bool transfersNoPointers(MemTransferInst &MI, const DataLayout &DL) {
   // if (!srcTy->isSized()) return false;
 
   // // TODO: Go up to the GEP chain to find nearest fitting type to transfer.
-  // // This can occur when someone tries to transfer int the middle of a struct.
-  // if (length * 8 > DL.getTypeSizeInBits(srcTy)) {
+  // // This can occur when someone tries to transfer int the middle of a
+  // struct. if (length * 8 > DL.getTypeSizeInBits(srcTy)) {
   //   LOG("dsa-warn", errs() << "WARNING: MemTransfer past object size!\n"
   //                          << "\tTransfer:  ");
   //   LOG("dsa", MI.print(errs()));
@@ -1627,8 +1859,9 @@ void IntraBlockBuilder::visitMemTransferInst(MemTransferInst &I) {
   seadsa::Cell destCell = m_graph.mkCell(*I.getDest(), seadsa::Cell());
 
   if (TrustTypes &&
-      // FIXME: LLVM 15, Kevin: The removal of the pointer type means we can no longer avoid unification upon a memory
-      // operation by looking at its type.
+      // FIXME: LLVM 15, Kevin: The removal of the pointer type means we can no
+      // longer avoid unification upon a memory operation by looking at its
+      // type.
       (transfersNoPointers(I, m_dl))) {
     /* do nothing */
     // no pointers are copied from source to dest, so there is no
