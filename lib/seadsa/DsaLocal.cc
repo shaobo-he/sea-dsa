@@ -147,6 +147,13 @@ struct TypeEvidence {
 
   void merge(Type *Candidate) {
     if (!Candidate || Conflict) return;
+    // Function pointees are collapsed to a single representative: the same
+    // function is routinely used at call sites whose signature differs from
+    // its definition (varargs casts, K&R C), which must not read as
+    // conflicting evidence.
+    if (auto *FT = dyn_cast<FunctionType>(Candidate))
+      Candidate =
+          FunctionType::get(Type::getVoidTy(FT->getContext()), false);
     if (!Ty) {
       Ty = Candidate;
       return;
@@ -159,9 +166,12 @@ struct TypeEvidence {
 };
 
 Type *inferPointeeType(const Value *V, SmallPtrSetImpl<const Value *> &Seen);
-Type *inferPointeeTypeFromUses(const Value *V,
-                               SmallPtrSetImpl<const Value *> &Seen);
 
+/// The type a memory access through/of \p V observes, for use as EVIDENCE
+/// when inferring the pointee of another value. In opaque-pointer modules
+/// the result for pointer-typed values is simply the (opaque) pointer type;
+/// this function must NOT be used to recover pointee types for field keys
+/// or accessed-type records -- use the FieldType-based helpers below.
 Type *accessTypeForValue(const Value *V, SmallPtrSetImpl<const Value *> &Seen) {
   Type *Ty = V->getType();
   if (!Ty->isPointerTy()) return Ty;
@@ -170,38 +180,6 @@ Type *accessTypeForValue(const Value *V, SmallPtrSetImpl<const Value *> &Seen) {
   if (!PointeeTy) return Ty;
 
   return PointerType::get(PointeeTy, cast<PointerType>(Ty)->getAddressSpace());
-}
-
-Type *accessTypeForValue(const Value *V) {
-  SmallPtrSet<const Value *, 16> Seen;
-  return accessTypeForValue(V, Seen);
-}
-
-bool hasPointerTypeEvidence(Type *Ty) {
-  auto *PTy = dyn_cast<PointerType>(Ty);
-  return !PTy || !PTy->isOpaque();
-}
-
-Type *memoryAccessTypeForLoad(const LoadInst &LI) {
-  SmallPtrSet<const Value *, 16> Seen;
-  Type *AccessTy = accessTypeForValue(&LI, Seen);
-  if (hasPointerTypeEvidence(AccessTy)) return AccessTy;
-
-  if (Type *MemoryTy = inferPointeeType(LI.getPointerOperand(), Seen))
-    return MemoryTy;
-
-  return AccessTy;
-}
-
-Type *memoryAccessTypeForStore(const StoreInst &SI) {
-  SmallPtrSet<const Value *, 16> Seen;
-  Type *AccessTy = accessTypeForValue(SI.getValueOperand(), Seen);
-  if (hasPointerTypeEvidence(AccessTy)) return AccessTy;
-
-  if (Type *MemoryTy = inferPointeeType(SI.getPointerOperand(), Seen))
-    return MemoryTy;
-
-  return AccessTy;
 }
 
 bool isUsefulFieldEvidence(const seadsa::FieldType &FTy) {
@@ -257,6 +235,24 @@ fieldTypeForMemoryPointer(const Value *Ptr,
                            Result, HasResult, Conflict);
       continue;
     }
+
+    if (const auto *CXI = dyn_cast<AtomicCmpXchgInst>(Usr)) {
+      if (CXI->getPointerOperand()->stripPointerCasts() == StrippedPtr) {
+        mergeFieldEvidence(fieldTypeForValue(CXI->getCompareOperand(), Seen),
+                           Result, HasResult, Conflict);
+        mergeFieldEvidence(fieldTypeForValue(CXI->getNewValOperand(), Seen),
+                           Result, HasResult, Conflict);
+      }
+      continue;
+    }
+
+    if (const auto *RMWI = dyn_cast<AtomicRMWInst>(Usr)) {
+      if (RMWI->getPointerOperand()->stripPointerCasts() == StrippedPtr &&
+          RMWI->getOperation() == AtomicRMWInst::Xchg)
+        mergeFieldEvidence(fieldTypeForValue(RMWI->getValOperand(), Seen),
+                           Result, HasResult, Conflict);
+      continue;
+    }
   }
 
   return Conflict || !HasResult ? seadsa::FieldType::mkUnknown() : Result;
@@ -278,6 +274,21 @@ seadsa::FieldType fieldTypeForStore(const StoreInst &SI) {
 
   FTy = fieldTypeForMemoryPointer(SI.getPointerOperand(), Seen);
   return FTy.isUnknown() ? seadsa::FieldType(SI.getValueOperand()->getType())
+                         : FTy;
+}
+
+/// Field type for the pointer content read/written by a cmpxchg, keyed
+/// consistently with fieldTypeForLoad/fieldTypeForStore of the same slot.
+seadsa::FieldType fieldTypeForCmpXchg(const AtomicCmpXchgInst &I) {
+  SmallPtrSet<const Value *, 16> Seen;
+  seadsa::FieldType FTy = fieldTypeForValue(I.getCompareOperand(), Seen);
+  if (isUsefulFieldEvidence(FTy)) return FTy;
+
+  FTy = fieldTypeForValue(I.getNewValOperand(), Seen);
+  if (isUsefulFieldEvidence(FTy)) return FTy;
+
+  FTy = fieldTypeForMemoryPointer(I.getPointerOperand(), Seen);
+  return FTy.isUnknown() ? seadsa::FieldType(I.getCompareOperand()->getType())
                          : FTy;
 }
 
@@ -320,9 +331,25 @@ Type *inferPointeeTypeFromUses(const Value *V,
     }
 
     if (const auto *CB = dyn_cast<CallBase>(Usr)) {
-      if (CB->getCalledOperand() &&
-          CB->getCalledOperand()->stripPointerCasts() == StrippedV)
+      if (CB->isArgOperand(&U)) {
+        // -- pointee-carrying parameter attributes survived the switch to
+        // -- opaque pointers and are exact
+        unsigned ArgNo = CB->getArgOperandNo(&U);
+        const AttributeList &AL = CB->getAttributes();
+        if (Type *T = CB->getParamByValType(ArgNo))
+          Evidence.merge(T);
+        else if (Type *T = AL.getParamStructRetType(ArgNo))
+          Evidence.merge(T);
+        else if (Type *T = AL.getParamInAllocaType(ArgNo))
+          Evidence.merge(T);
+        else if (Type *T = AL.getParamPreallocatedType(ArgNo))
+          Evidence.merge(T);
+        else if (Type *T = CB->getParamElementType(ArgNo))
+          Evidence.merge(T);
+      } else if (CB->getCalledOperand() &&
+                 CB->getCalledOperand()->stripPointerCasts() == StrippedV) {
         Evidence.merge(CB->getFunctionType());
+      }
       continue;
     }
 
@@ -339,6 +366,12 @@ Type *inferPointeeTypeFromUses(const Value *V,
 Type *inferPointeeType(const Value *V, SmallPtrSetImpl<const Value *> &Seen) {
   if (!V || !V->getType()->isPointerTy()) return nullptr;
 
+  // -- Pointee inference is only for opaque-pointer modules. Typed-pointer
+  // -- modules (still legal in LLVM 15) carry pointee types in the IR, and
+  // -- field keys there must remain the IR types so all access sites agree
+  // -- with the code paths that do not run inference.
+  if (V->getContext().supportsTypedPointers()) return nullptr;
+
   V = V->stripPointerCasts();
   if (!Seen.insert(V).second) return nullptr;
 
@@ -347,6 +380,13 @@ Type *inferPointeeType(const Value *V, SmallPtrSetImpl<const Value *> &Seen) {
   if (const auto *GV = dyn_cast<GlobalVariable>(V)) return GV->getValueType();
 
   if (const auto *AI = dyn_cast<AllocaInst>(V)) return AI->getAllocatedType();
+
+  if (const auto *A = dyn_cast<Argument>(V)) {
+    // -- pointee-carrying parameter attributes are exact
+    if (Type *T = A->getParamByValType()) return T;
+    if (Type *T = A->getParamStructRetType()) return T;
+    if (Type *T = A->getParamInAllocaType()) return T;
+  }
 
   if (const auto *GEP = dyn_cast<GEPOperator>(V))
     return GEP->getResultElementType();
@@ -546,38 +586,37 @@ class GlobalBuilder : public BlockBuilderBase {
     if (isa<ConstantDataSequential>(Init)) { return; }
 
     if (Init->getType()->isPointerTy() && !isa<ConstantPointerNull>(Init)) {
-      // FIXME: This creates a node for a global function pointer. Needed by
-      // vtable in C++
-      // Disabled for now since in LLVM 15 there is no way to determine if the
-      // pointer is a function. May be inferenced by checking if the pointer is
-      // ever loaded as a function.
+      // This creates a node for a global function pointer. Needed by
+      // vtables in C++ and static dispatch tables in C. The initializer is
+      // a constant, so no pointee type is needed to recognize a function
+      // (stripPointerCasts also resolves aliases and cast expressions
+      // wrapping one).
+      if (isa<Function>(Init->stripPointerCasts())) {
+        seadsa::Node &n = m_graph.mkNode();
+        seadsa::Cell nc(n, 0);
+        seadsa::DsaAllocSite *site = m_graph.mkAllocSite(*Init);
+        assert(site);
+        n.addAllocSite(*site);
 
-      // if (cast<PointerType>(Init->getType())
-      //         ->getElementType()
-      //         ->isFunctionTy()) {
-      //   seadsa::Node &n = m_graph.mkNode();
-      //   seadsa::Cell nc(n, 0);
-      //   seadsa::DsaAllocSite *site = m_graph.mkAllocSite(*Init);
-      //   assert(site);
-      //   n.addAllocSite(*site);
+        // connect c with nc. The field is keyed with the plain pointer
+        // type; loads of this slot keyed with an inferred pointee join it
+        // (see Node::addLink).
+        c.growSize(0, Init->getType());
+        c.addAccessedType(0, Init->getType());
+        c.addLink(seadsa::Field(0, seadsa::FieldType(Init->getType())), nc);
+        return;
+      }
 
-      //   // connect c with nc
-      //   c.growSize(0, Init->getType());
-      //   c.addAccessedType(0, Init->getType());
-      //   c.addLink(seadsa::Field(0, seadsa::FieldType(Init->getType())), nc);
-      //   return;
-      // }
-
-      // if (m_graph.hasCell(*Init)) {
-      //   // @g1 =  ...*
-      //   // @g2 =  ...** @g1
-      //   seadsa::Cell &nc = m_graph.mkCell(*Init, seadsa::Cell());
-      //   // connect c with nc
-      //   c.growSize(0, Init->getType());
-      //   c.addAccessedType(0, Init->getType());
-      //   c.addLink(seadsa::Field(0, seadsa::FieldType(Init->getType())), nc);
-      //   return;
-      // }
+      if (m_graph.hasCell(*Init)) {
+        // @g1 =  ...*
+        // @g2 =  ...** @g1
+        seadsa::Cell &nc = m_graph.mkCell(*Init, seadsa::Cell());
+        // connect c with nc
+        c.growSize(0, Init->getType());
+        c.addAccessedType(0, Init->getType());
+        c.addLink(seadsa::Field(0, seadsa::FieldType(Init->getType())), nc);
+        return;
+      }
     }
   }
 
@@ -948,8 +987,7 @@ void IntraBlockBuilder::visitLoadInst(LoadInst &LI) {
 
   Cell base = valueCell(*LI.getPointerOperand()->stripPointerCasts());
   assert(!base.isNull());
-  Type *AccessTy = memoryAccessTypeForLoad(LI);
-  base.addAccessedType(0, AccessTy);
+  base.addAccessedType(0, LI.getType());
   base.setRead();
   // update/create the link
   if (!isSkip(LI)) {
@@ -993,15 +1031,14 @@ void IntraBlockBuilder::visitAtomicCmpXchgInst(AtomicCmpXchgInst &I) {
 
   PtrC.setModified();
   PtrC.setRead();
-  Type *AccessTy =
-      ResTy->isPointerTy() ? accessTypeForValue(I.getCompareOperand()) : ResTy;
-  PtrC.growSize(0, AccessTy);
-  PtrC.addAccessedType(0, AccessTy);
+  PtrC.growSize(0, Ptr->getType());
+  PtrC.addAccessedType(0, Ptr->getType());
 
   if (ResTy->isPointerTy()) {
     // Load the content of Ptr and make it the cell of the
-    // instruction's result.
-    Field LoadedField(0, FieldType(AccessTy));
+    // instruction's result. Key the field consistently with loads and
+    // stores of the same slot.
+    Field LoadedField(0, fieldTypeForCmpXchg(I));
     if (!PtrC.hasLink(LoadedField)) {
       Node &n = m_graph.mkNode();
       PtrC.addLink(LoadedField, Cell(n, 0));
@@ -1060,10 +1097,9 @@ void IntraBlockBuilder::visitStoreInst(StoreInst &SI) {
   base.setModified();
 
   Value *ValOp = SI.getValueOperand();
-  Type *AccessTy = memoryAccessTypeForStore(SI);
   // XXX: potentially it is enough to update size only at this point
-  base.growSize(0, AccessTy);
-  base.addAccessedType(0, AccessTy);
+  base.growSize(0, ValOp->getType());
+  base.addAccessedType(0, ValOp->getType());
 
   if (isSkip(*ValOp)) return;
 
@@ -1352,9 +1388,8 @@ void IntraBlockBuilder::visitInsertValueInst(InsertValueInst &I) {
   Value &v = *I.getInsertedValueOperand();
   uint64_t offset = computeIndexedOffset(I.getType(), I.getIndices(), m_dl);
   Cell out(op, offset);
-  Type *AccessTy = accessTypeForValue(&v);
-  out.growSize(0, AccessTy);
-  out.addAccessedType(0, AccessTy);
+  out.growSize(0, v.getType());
+  out.addAccessedType(0, v.getType());
   out.setModified();
 
   // -- update link
@@ -1362,7 +1397,7 @@ void IntraBlockBuilder::visitInsertValueInst(InsertValueInst &I) {
     // TODO: follow valueCell ptrs.
     Cell vCell = valueCell(v);
     assert(!vCell.isNull());
-    out.addLink(Field(0, FieldType(AccessTy)), vCell);
+    out.addLink(Field(0, FieldType(v.getType())), vCell);
   }
 }
 
@@ -1382,12 +1417,11 @@ void IntraBlockBuilder::visitExtractValueInst(ExtractValueInst &I) {
 
   uint64_t offset = computeIndexedOffset(I.getAggregateOperand()->getType(),
                                          I.getIndices(), m_dl);
-  Type *AccessTy = accessTypeForValue(&I);
-  FieldType opType(AccessTy);
+  FieldType opType(I.getType());
   Cell in(op, offset);
 
   // -- update type record
-  in.addAccessedType(0, AccessTy);
+  in.addAccessedType(0, I.getType());
   in.setRead();
 
   if (!isSkip(I)) {
@@ -1774,13 +1808,17 @@ bool hasNoPointerTy(const llvm::Type *t) {
   return true;
 }
 
-bool transfersNoPointers(MemTransferInst &MI, const DataLayout &DL) {
-  // FIXME: LLVM 15, Kevin: Since we can no longer access pointee types, it is
-  // now
-  // impossible to determine whether the pointee's struct type contains
-  // pointers. This whole function is effectively hamstrung as it now only
-  // returns false.
+/// Pointee type of a memtransfer's source: from the IR in typed-pointer
+/// modules, from pointee inference in opaque-pointer ones. Null if unknown.
+Type *memTransferSrcPointeeTy(MemTransferInst &MI) {
+  auto *PTy = cast<PointerType>(MI.getSource()->getType());
+  if (!PTy->isOpaque()) return PTy->getNonOpaquePointerElementType();
 
+  SmallPtrSet<const Value *, 16> Seen;
+  return inferPointeeType(MI.getSource(), Seen);
+}
+
+bool transfersNoPointers(MemTransferInst &MI, const DataLayout &DL) {
   ConstantInt *rawLength = dyn_cast<ConstantInt>(MI.getLength());
   if (!rawLength)
     return false; // Analysis is not possible if length is not constant
@@ -1788,42 +1826,44 @@ bool transfersNoPointers(MemTransferInst &MI, const DataLayout &DL) {
   const uint64_t length = rawLength->getZExtValue();
   LOG("dsa", errs() << "MemTransfer length:\t" << length << "\n");
 
-  // // opaque structs may transfer pointers
-  // if (!srcTy->isSized()) return false;
+  Type *srcTy = memTransferSrcPointeeTy(MI);
+  if (!srcTy) return false; // Cannot determine the transferred type
 
-  // // TODO: Go up to the GEP chain to find nearest fitting type to transfer.
-  // // This can occur when someone tries to transfer int the middle of a
-  // struct. if (length * 8 > DL.getTypeSizeInBits(srcTy)) {
-  //   LOG("dsa-warn", errs() << "WARNING: MemTransfer past object size!\n"
-  //                          << "\tTransfer:  ");
-  //   LOG("dsa", MI.print(errs()));
-  //   LOG("dsa-warn", errs() << "\n\tLength:  " << length << "\n\tType size:  "
-  //                          << (DL.getTypeSizeInBits(srcTy) / 8) << "\n");
-  //   return false;
-  // }
+  // opaque structs may transfer pointers
+  if (!srcTy->isSized()) return false;
 
-  // static SmallDenseMap<std::pair<Type *, unsigned>, bool, 16>
-  //     knownNoPointersInStructs;
+  // TODO: Go up to the GEP chain to find nearest fitting type to transfer.
+  // This can occur when someone tries to transfer in the middle of a struct.
+  if (length * 8 > DL.getTypeSizeInBits(srcTy)) {
+    LOG("dsa-warn", errs() << "WARNING: MemTransfer past object size!\n"
+                           << "\tTransfer:  ");
+    LOG("dsa", MI.print(errs()));
+    LOG("dsa-warn", errs() << "\n\tLength:  " << length << "\n\tType size:  "
+                           << (DL.getTypeSizeInBits(srcTy) / 8) << "\n");
+    return false;
+  }
 
-  // if (knownNoPointersInStructs.count({srcTy, length}) != 0)
-  //   return knownNoPointersInStructs[{srcTy, length}];
+  static SmallDenseMap<std::pair<Type *, unsigned>, bool, 16>
+      knownNoPointersInStructs;
 
-  // for (auto &subTy : seadsa::AggregateIterator::range(srcTy, &DL)) {
-  //   if (subTy.Offset >= length) break;
+  if (knownNoPointersInStructs.count({srcTy, length}) != 0)
+    return knownNoPointersInStructs[{srcTy, length}];
 
-  //   if (subTy.Ty->isPointerTy()) {
-  //     LOG("dsa", errs() << "Found ptr member "; subTy.Ty->print(errs());
-  //         errs() << "\n\tin "; srcTy->print(errs());
-  //         errs() << "\n\tMemTransfer transfers pointers!\n");
+  for (auto &subTy : seadsa::AggregateIterator::range(srcTy, &DL)) {
+    if (subTy.Offset >= length) break;
 
-  //     knownNoPointersInStructs[{srcTy, length}] = false;
-  //     return false;
-  //   }
-  // }
+    if (subTy.Ty->isPointerTy()) {
+      LOG("dsa", errs() << "Found ptr member "; subTy.Ty->print(errs());
+          errs() << "\n\tin "; srcTy->print(errs());
+          errs() << "\n\tMemTransfer transfers pointers!\n");
 
-  // knownNoPointersInStructs[{srcTy, length}] = true;
-  // return true;
-  return false;
+      knownNoPointersInStructs[{srcTy, length}] = false;
+      return false;
+    }
+  }
+
+  knownNoPointersInStructs[{srcTy, length}] = true;
+  return true;
 }
 
 void IntraBlockBuilder::visitMemTransferInst(MemTransferInst &I) {
@@ -1858,11 +1898,17 @@ void IntraBlockBuilder::visitMemTransferInst(MemTransferInst &I) {
   seadsa::Cell sourceCell = valueCell(*I.getSource());
   seadsa::Cell destCell = m_graph.mkCell(*I.getDest(), seadsa::Cell());
 
+  // -- the transferred type: declared in typed-pointer modules, inferred in
+  // -- opaque ones. When it is unknown (null) the fast path must NOT be
+  // -- taken: dev14 always saw a declared source type here (getSource()
+  // -- strips casts), so requiring a known pointer-free type is the
+  // -- faithful -- and sound -- restoration.
+  Type *srcPointeeTy = memTransferSrcPointeeTy(I);
+
   if (TrustTypes &&
-      // FIXME: LLVM 15, Kevin: The removal of the pointer type means we can no
-      // longer avoid unification upon a memory operation by looking at its
-      // type.
-      (transfersNoPointers(I, m_dl))) {
+      ((sourceCell.getNode()->links().size() == 0 && srcPointeeTy &&
+        hasNoPointerTy(srcPointeeTy)) ||
+       transfersNoPointers(I, m_dl))) {
     /* do nothing */
     // no pointers are copied from source to dest, so there is no
     // need to unify them
@@ -1922,7 +1968,16 @@ bool BlockBuilderBase::isFixedOffset(const IntToPtrInst &inst, Value *&base,
           valueCell(*LI->getPointerOperand()->stripPointerCasts());
       ptrCell.addAccessedType(0, liType);
       ptrCell.setRead();
-      seadsa::Field LoadedField(0, seadsa::FieldType(liType));
+      // The value is reinterpreted as a byte pointer. In typed-pointer
+      // modules FieldType(i8*) is the omnipotent char pointer; recover the
+      // same omni semantics for opaque modules via an explicit i8 pointee,
+      // so this field joins whatever field visitLoadInst keyed for LI.
+      seadsa::FieldType loadedTy =
+          LI->getContext().supportsTypedPointers()
+              ? seadsa::FieldType(liType)
+              : seadsa::FieldType::mkPointerTo(
+                    Type::getInt8Ty(LI->getContext()));
+      seadsa::Field LoadedField(0, loadedTy);
       if (!ptrCell.hasLink(LoadedField)) {
         seadsa::Node &n = m_graph.mkNode();
         // XXX: This node will have no allocation site

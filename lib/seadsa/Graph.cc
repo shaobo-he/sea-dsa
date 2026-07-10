@@ -145,6 +145,9 @@ void Node::growSize(unsigned v) {
 void Node::growSize(const Offset &offset, const llvm::Type *t) {
   if (!t) return;
   if (t->isVoidTy()) return;
+  // -- unsized types (e.g. function or opaque struct types, which pointee
+  // -- inference can produce) have no allocation size to grow by
+  if (!t->isSized()) return;
   if (isOffsetCollapsed()) return;
 
   assert(m_graph);
@@ -183,6 +186,11 @@ void Node::addAccessedType(unsigned off, llvm::Type *type) {
 
     unsigned o = offsetType.first;
     llvm::Type *t = offsetType.second;
+
+    // -- skip unsized types (e.g. function or opaque struct types): they can
+    // -- neither be expanded nor sized, and recording them as accessed types
+    // -- is meaningless
+    if (!t->isVoidTy() && !t->isSized()) continue;
 
     Offset offset(*this, o);
     growSize(offset, t);
@@ -387,18 +395,46 @@ Cell &Node::getLink_(const Field &_f) {
   return *res;
 }
 
+/// Resolve \p _f to an existing link, applying the same compatibility rules
+/// addLink() maintains: exact match, then the omni link at this offset, then
+/// -- for a pointee-typed pointer field -- the unknown-pointee pointer link
+/// it would have been joined into. Returns nullptr if no link exists.
+const Cell *Node::findLink(Field _f) const {
+  assert(!isForwarding());
+  Field f = Offset::getAdjustedField(*this, _f);
+
+  auto it = m_links.find(f);
+  if (it != m_links.end()) return it->second.get();
+
+  if (FieldType::IsNotTypeAware() || f.hasOmniType()) return nullptr;
+
+  auto om = m_links.find(f.mkOmniField());
+  if (om != m_links.end()) return om->second.get();
+
+  if (f.getType().isPointer()) {
+    // -- addLink keeps at most one pointer link per offset and base pointer
+    // -- type, so a pointer field resolves to that link whatever pointee
+    // -- (or none) either side carries
+    const FieldType plainTy(f.getType().getLLVMType());
+    for (auto &kv : m_links)
+      if (kv.first.getOffset() == f.getOffset() &&
+          kv.first.getType().isPointer() &&
+          FieldType(kv.first.getType().getLLVMType()) == plainTy)
+        return kv.second.get();
+  }
+
+  return nullptr;
+}
+
+bool Node::hasLink(Field f) const {
+  assert(g_IsTypeAware || f.getType().isUnknown() || f.getType().isOmniType());
+  return findLink(f) != nullptr;
+}
+
 const Cell &Node::getLink(Field _f) const {
   assert(!isForwarding());
   assert(g_IsTypeAware || _f.getType().isUnknown() || _f.getType().isOmniType());
-  Field f = Offset::getAdjustedField(*this, _f);
-
-  if (m_links.count(f)) return *m_links.at(f);
-
-  // -- only reason to be here is because of omni type
-  assert(!FieldType::IsNotTypeAware());
-  assert(!f.hasOmniType());
-  Field omni = f.mkOmniField();
-  if (m_links.count(omni)) return *m_links.at(omni);
+  if (const Cell *c = findLink(_f)) return *c;
 
   assert(false); // unreachable
   llvm_unreachable("unreachable");
@@ -416,7 +452,7 @@ void Node::addLink(Field _f, const Cell &c) {
 
   const Field f = Offset(*this, _f.getOffset()).getAdjustedField(_f);
 
-  if (hasLink(f)) {
+  if (m_links.count(f)) {
     Cell &link = getLink_(f);
     Cell cc(c);
     link.unify(cc);
@@ -425,11 +461,60 @@ void Node::addLink(Field _f, const Cell &c) {
 
   if (!FieldType::IsNotTypeAware()) {
     const Field omniField = f.mkOmniField();
-    if (hasLink(omniField)) {
+    if (m_links.count(omniField)) {
       assert(!f.hasOmniType());
       Cell &link = getLink_(omniField);
       Cell cc(c);
       link.unify(cc);
+      return;
+    }
+  }
+
+  // -- Pointer fields whose keys differ only in the (inferred) pointee may
+  // -- denote the same slot: inferred pointees are evidence, not declared
+  // -- types, so two different answers for one offset mean the pointee is
+  // -- not known -- NOT that the slots are disjoint. All pointer links at
+  // -- an offset that share the base pointer type therefore unify into a
+  // -- single link; when their pointee keys disagree the surviving link is
+  // -- re-keyed to the unknown-pointee form (mirroring TypeEvidence
+  // -- conflict semantics). Typed-pointer modules are unaffected: their
+  // -- keys differ in the base pointer type itself and never carry inferred
+  // -- pointees.
+  if (!FieldType::IsNotTypeAware() && !f.hasOmniType() &&
+      f.getType().isPointer()) {
+    const Field plain(f.getOffset(), FieldType(f.getType().getLLVMType()));
+    auto joins = [&plain](const Field &key) {
+      return key.getOffset() == plain.getOffset() &&
+             key.getType().isPointer() &&
+             FieldType(key.getType().getLLVMType()) == plain.getType();
+    };
+    bool anyPtrHere = false;
+    for (auto &kv : m_links) {
+      if (joins(kv.first)) {
+        anyPtrHere = true;
+        break;
+      }
+    }
+    if (anyPtrHere) {
+      // -- move the joinable pointer links aside, keep the rest
+      Node::links_type new_links;
+      SmallVector<std::pair<Field, CellRef>, 16> saved_links;
+      for (auto &kv : m_links) {
+        if (joins(kv.first))
+          saved_links.push_back({kv.first, std::move(kv.second)});
+        else
+          new_links[kv.first] = std::move(kv.second);
+      }
+      new_links[plain].reset(new Cell(c));
+      m_links = std::move(new_links);
+
+      // -- re-add the saved pointer links through a cell so forwarding is
+      // -- resolved; each re-add hits either the exact unknown-pointee key
+      // -- or this join again with the plain link as its only member, so
+      // -- the recursion terminates
+      Cell cc(*this, 0);
+      for (auto &kv : saved_links)
+        cc.addLink(kv.first, *kv.second);
       return;
     }
   }

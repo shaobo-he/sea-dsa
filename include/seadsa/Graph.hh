@@ -593,6 +593,11 @@ private:
 
   Cell &getLink_(const Field &_f);
 
+  /// Resolve a field to an existing link under the compatibility rules
+  /// maintained by addLink() (exact, omni, unknown-pointee pointer).
+  /// Returns nullptr if no compatible link exists.
+  const Cell *findLink(Field f) const;
+
   /// Adds a set of types for a field at a given offset
   void addAccessedType(const Offset &offset, Set types);
 
@@ -734,10 +739,7 @@ public:
   unsigned size() const { return m_size; }
   void growSize(unsigned v);
 
-  bool hasLink(Field f) const {
-    assert(g_IsTypeAware || f.getType().isUnknown() || f.getType().isOmniType());
-    return m_links.count(Offset::getAdjustedField(*this, f));
-  }
+  bool hasLink(Field f) const;
 
   unsigned getNumLinks() const { return m_links.size(); }
 

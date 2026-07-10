@@ -38,17 +38,26 @@ llvm::Type *GetInnermostTypeImpl(llvm::Type *const Ty, SeenTypes &seen) {
   while (!seen.count(currentTy)) {
     seen.insert(currentTy);
 
-    // FIXME: We're at a dead-end when we encounter a pointer type.
-    if (currentTy->isPointerTy()) break;
+    if (currentTy->isPointerTy()) {
+      auto *PTy = llvm::cast<llvm::PointerType>(currentTy);
+      // Opaque pointers carry no element type: dead-end. (Pointee types
+      // recovered by inference are canonicalized separately, see the
+      // FieldType two-argument constructor.)
+      if (PTy->isOpaque()) break;
+      auto *ElemTy = PTy->getNonOpaquePointerElementType();
+      currentTy = GetInnermostTypeImpl(ElemTy, seen)
+                      ->getPointerTo(PTy->getAddressSpace());
+      break;
+    }
 
     auto It = AggregateIterator::mkBegin(currentTy, /* DL = */ nullptr);
     auto *FirstTy = It->Ty;
     if (!FirstTy) break;
 
-    // FIXME: We cannot check this
-    // if (FirstTy->isPointerTy() && FirstTy->getPointerElementType() ==
-    // currentTy)
-    //   break;
+    if (FirstTy->isPointerTy() &&
+        !llvm::cast<llvm::PointerType>(FirstTy)->isOpaque() &&
+        FirstTy->getNonOpaquePointerElementType() == currentTy)
+      break;
 
     if (FirstTy == currentTy) break;
 
@@ -62,7 +71,8 @@ llvm::Type *GetInnermostTypeImpl(llvm::Type *const Ty, SeenTypes &seen) {
 
 /// This is intended to be used within a single llvm::Context. When there's more
 /// than one context, the caching might misbehave.
-/// LLVM 15: the lack of a pointee type means that pointers are also primitive
+/// LLVM 15: typed pointers still canonicalize through their element type as
+/// in dev14; OPAQUE pointers carry no pointee and are treated as primitive
 /// types, which may be returned.
 llvm::Type *GetFirstPrimitiveTy(llvm::Type *const Ty) {
   assert(Ty);
@@ -117,7 +127,22 @@ FieldType::FieldType(llvm::Type *Ty) {
 
 FieldType::FieldType(llvm::Type *Ty, llvm::Type *PointeeTy) : FieldType(Ty) {
   assert(PointeeTy);
-  m_pointee_ty = IsNotTypeAware() ? nullptr : PointeeTy;
+  // Canonicalize the pointee the same way field types themselves are
+  // canonicalized so that e.g. ptr<%struct.S> and ptr<first-field-of-S>
+  // denote the same field (dev14 got this for free from GetFirstPrimitiveTy
+  // recursing through pointer element types).
+  //
+  // Function pointees are collapsed to a single representative: the same
+  // function is routinely used at call sites whose signature differs from
+  // its definition (varargs casts, K&R C), and field identity only needs
+  // "pointer to function", not the exact signature.
+  llvm::Type *CanonTy =
+      llvm::isa<llvm::FunctionType>(PointeeTy)
+          ? llvm::FunctionType::get(
+                llvm::Type::getVoidTy(PointeeTy->getContext()),
+                /*isVarArg=*/false)
+          : GetFirstPrimitiveTy(PointeeTy);
+  m_pointee_ty = IsNotTypeAware() ? nullptr : CanonTy;
   if (m_pointee_ty && EnableOmnipotentChar)
     m_is_omni = IsOmnipotentChar(m_pointee_ty);
 }

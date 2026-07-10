@@ -1,8 +1,11 @@
 #include "seadsa/Cloner.hh"
 #include "seadsa/CallSite.hh"
 #include "seadsa/support/Debug.h"
+#include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/Support/CommandLine.h"
+
+#include <algorithm>
 using namespace seadsa;
 
 static llvm::cl::opt<bool> NoAllocSiteOpt(
@@ -29,9 +32,27 @@ static bool isConstantNoPtr(const llvm::Value *v) {
 
   if (!v->getType()->isPointerTy()) return false;
 
-  // TODO: Can infer pointer type by checking its uses. For now, not much
-  // can be done and precision will be lost to opaque pointers in LLVM 15.
-  return false;
+  // The values that reach here are global constants; a global carries its
+  // value type regardless of opaque pointers.
+  llvm::Type *type = nullptr;
+  if (auto *GV = llvm::dyn_cast<llvm::GlobalVariable>(v))
+    type = GV->getValueType();
+  else if (auto *PTy = llvm::dyn_cast<llvm::PointerType>(v->getType()))
+    if (!PTy->isOpaque()) type = PTy->getNonOpaquePointerElementType();
+  if (!type) return false;
+
+  if (type->isIntegerTy() || type->isFloatingPointTy())
+    return true;
+
+  // Shaobo: LLVM 11 removes `CompositeType`, which was a union of ArrayType,
+  // StructType, and VectorType.
+  if (!type->isAggregateType() && !type->isVectorTy())
+    return false;
+
+  return std::all_of(type->subtype_begin(), type->subtype_end(),
+                     [](const llvm::Type *ty) {
+                       return ty->isIntegerTy() || ty->isFloatingPointTy();
+                     });
 }
 
 Node &Cloner::clone(const Node &n, bool forceAddAlloca,

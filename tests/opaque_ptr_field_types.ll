@@ -1,7 +1,14 @@
+; Pointee types recovered from use evidence (gep i32 / gep double) show up as
+; distinct ptr<T> field keys. The two link labels live on different nodes and
+; their emission order follows Type* allocation order, which is not
+; deterministic -- so each pattern is checked by its own OutputCheck
+; invocation instead of one order-sensitive sequence.
+;
 ; RUN: %seadsa %s %ci_dsa --sea-dsa-dot --sea-dsa-type-aware=true --sea-dsa-dot-outdir=%T/opaque_ptr_field_types.ll
-; RUN: cat %T/opaque_ptr_field_types.ll/main.mem.dot | OutputCheck %s -d --comment=";"
-; CHECK: ptr<i32>
-; CHECK: ptr<double>
+; RUN: cat %T/opaque_ptr_field_types.ll/main.mem.dot | OutputCheck %s -d --comment=";" --check-prefix=CHECK-I32
+; RUN: cat %T/opaque_ptr_field_types.ll/main.mem.dot | OutputCheck %s -d --comment=";" --check-prefix=CHECK-DBL
+; CHECK-I32: ptr<i32>
+; CHECK-DBL: ptr<double>
 
 target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
 target triple = "x86_64-pc-linux-gnu"
