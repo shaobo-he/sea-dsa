@@ -160,8 +160,12 @@ Node &Cloner::clone(const Node &n, bool forceAddAlloca,
     kv.second->getNode();
     // recursively clone the node pointed by the link
     Cell nCell(&clone(*kv.second->getNode()), rawOffset);
-    // create new link
-    nNode.setLink(kv.first, nCell);
+    // create new link. Install through addLink (via a cell so forwarding is
+    // resolved): source keys stored at different raw offsets can re-adjust
+    // to the same offset in the clone, and addLink unifies such collisions
+    // where a raw setLink would either clobber the previous link or break
+    // the one-pointer-link-per-offset invariant.
+    Cell(&nNode, 0).addLink(kv.first, nCell);
   }
 
   // nNode can be forwarding if the original node was collapsed and the new one
